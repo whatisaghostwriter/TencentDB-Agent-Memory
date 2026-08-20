@@ -1,0 +1,67 @@
+# 由 deploy/compose 的 config-init 服务用 envsubst 渲染成 /data/config/tdai-gateway.yaml。
+# 值与 deploy/global-images/start-memory-core.sh 自动生成的一致（memory 引擎默认参数）。
+# 该文件不含密钥：LLM credential 通过 env 变量从 .env 渲染。
+# 网关本身亦支持在字符串值里写变量引用做运行时展开，这里为 envsubst 一次性展开。
+
+deployMode: standalone
+stateBackend: local
+
+server:
+  port: 8420
+  host: 0.0.0.0
+
+data:
+  baseDir: /data/tdai-memory
+
+llm:
+  baseUrl: "${MEMORY_LLM_BASE_URL}"
+  apiKey: "${MEMORY_LLM_API_KEY}"
+  model: "${MEMORY_LLM_MODEL}"
+  maxTokens: 40960
+  timeoutMs: 300000
+
+memory:
+  promptMode: ${MEMORY_PROMPT_MODE}
+  capture: { enabled: true }
+  extraction:
+    enabled: true
+    enableDedup: true
+    maxMemoriesPerSession: 20
+  persona:
+    triggerEveryN: 50
+    maxScenes: 15
+  pipeline:
+    everyNConversations: 5
+    enableWarmup: true
+    l1IdleTimeoutSeconds: 600
+    l2DelayAfterL1Seconds: 90
+    l2MinIntervalSeconds: 900
+    l2MaxIntervalSeconds: 3600
+  recall:
+    enabled: true
+    maxResults: 5
+    scoreThreshold: 0.3
+    strategy: hybrid
+    timeoutMs: 5000
+  storeBackend: sqlite
+  embedding:
+    provider: none
+
+# Skill 模块（gateway 层顶级别）。routing/queue 默认走本地，无需 Redis。
+skill:
+  enabled: true
+  routing:
+    mode: bm25
+    searchTopK: 20
+  extraction:
+    enabled: true
+    maxIterations: 16
+    queue:
+      backend: local
+      keyPrefix: tdai
+      resultTtlSeconds: 86400
+      lockTtlMs: 600000
+      maxRetries: 2
+      retryBackoffsMs: [5000, 15000]
+  resources:
+    maxResourceSizeBytes: 5000000

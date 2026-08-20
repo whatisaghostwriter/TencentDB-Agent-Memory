@@ -1,0 +1,198 @@
+# =============================================================================
+# TencentDB-Agent-Memory — 本地一键栈 (docker compose)
+# -----------------------------------------------------------------------------
+# 该文件替代原 deploy/global-images/*.sh 安装脚本。它把原脚本编排的三件套
+# (memory-core 网关 + memory-hub 面板/知识 + memory-proxy 上下文代理) 描述成
+# 声明式的 compose 栈：
+#
+#   1. `config`     — 在业务容器起来之前，用 envsubst 把 templates/*.yaml
+#                     渲染为带字面值的 yaml，写进共享卷 `tdai-config`（只读挂载）。
+#   2. `memory-core`— 记忆网关 (:8420)，挂载渲染后的网关配置 + 数据卷。
+#   3. `init-admin` — 在 memory-core 健康后创建系统管理员 user_key（幂等：
+#                     HTTP 200 创建；409 已存在视为成功）。
+#   4. `memory-hub` — 面板 (:8125) + 知识 (:8424) 合并镜像，env-only（镜像内
+#                     的 start-combined.sh 自动生成 metadata-instances.json）。
+#   5. `proxy`      — 上下文代理 (:8096)，挂载渲染后的 proxy 配置。
+#
+# 用法（从本目录下执行）：
+#   cp .env.example .env      # 填入 REPLACE_ME 与管理员 user_key
+#   docker compose up -d
+#   docker compose logs -f      # 跟踪日志
+#   docker compose down          # 停容器，保留数据卷
+#   docker compose down -v       # 停容器 + 彻底清理（卷 + 网络 + 元数据）
+#   docker compose up -d --force-recreate   # 编辑 .env 后重新渲染并重启
+#
+# 默认使用 Docker Hub 公开镜像 (`image:`)。如需从本仓库源码构建 memory-core /
+# proxy，把对应的 `image:` 行换成下面的 `build:` 块：
+#   memory-core:  build: { context: ../../MemoryCore, dockerfile: Dockerfile }
+#   proxy:        build: { context: ../../MemoryProxy, dockerfile: Dockerfile }
+# (memory-hub 合并镜像的本地构建需先用 deploy/panel-knowledge-combined/build.sh
+#  准备 panel/knowledge 上下文目录。)
+# =============================================================================
+name: tdai-memory-stack
+services:
+
+  # ---------------------------------------------------------------------------
+  # config : 渲染网关 + proxy 的 yaml 配置（一次性）。
+  # alpine + gettext(envsubst)，两个 yaml 写进共享卷，供 memory-core / proxy
+  # 只读挂载。templates 里所有占位符均为 ${VAR}，对应 .env 中的变量。
+  # ---------------------------------------------------------------------------
+  config:
+    image: alpine:3.20
+    restart: "no"
+    env_file: .env
+    volumes:
+      - ./templates:/templates:ro
+      - tdai-config:/out
+    command: ["/bin/sh", "-c", "apk add --no-cache gettext >/dev/null 2>&1; envsubst < /templates/tdai-gateway.yaml > /out/tdai-gateway.yaml; envsubst < /templates/proxy-config.yaml > /out/proxy-config.yaml; echo '[config] rendered tdai-gateway.yaml + proxy-config.yaml into shared volume'"]
+
+  # ---------------------------------------------------------------------------
+  # memory-core : 记忆网关 (:8420)。auth/port/data 用 env 控制；LLM/技能/记忆引擎
+  # 参数来自挂载的网关 yaml（env 优先级高于 yaml，值保持一致）。
+  # ---------------------------------------------------------------------------
+  memory-core:
+    image: ${MEMORY_CORE_IMAGE:-agentmemory/memory-core:latest}
+    # build: { context: ../../MemoryCore, dockerfile: Dockerfile }   # ← 本地构建用
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TDAI_GATEWAY_HOST: "0.0.0.0"
+      TDAI_GATEWAY_PORT: "8420"
+      TDAI_GATEWAY_API_KEY: "${MEMORY_CORE_GATEWAY_API_KEY:-}"
+      TDAI_DATA_DIR: "/data/tdai-memory"
+      TDAI_DEPLOY_MODE: "standalone"
+      STATE_BACKEND: "local"
+      TDAI_INSTANCE_ID: "default"
+    depends_on:
+      config:
+        condition: service_completed_successfully
+    volumes:
+      - tdai-config:/data/config:ro
+      - tdai-memory-core-data:/data/tdai-memory
+    ports:
+      - "${MEMORY_CORE_PORT:-8420}:8420"
+    networks:
+      - tdai-memory-stack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8420/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # init-admin : 在 memory-core 健康后创建系统管理员 user_key。
+  # 幂等：首次 HTTP 200 创建；重启后 HTTP 409（用户已存在）视为成功。
+  # user_key 来自 MEMORY_CORE_ADMIN_USER_KEY，同时也是客户端拿去当
+  # `x-tdai-user-key` 的值。逻辑封装在 scripts/init-admin.sh（挂载只读），
+  # 这样 Compose 文件本身不含 shell 变量引用，避免插值歧义。
+  # ---------------------------------------------------------------------------
+  init-admin:
+    image: curlimages/curl:8.11.1
+    restart: "no"
+    env_file: .env
+    depends_on:
+      memory-core:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init-admin.sh:/init-admin.sh:ro
+    networks:
+      - tdai-memory-stack
+    command: ["sh", "/init-admin.sh"]
+
+  # ---------------------------------------------------------------------------
+  # memory-hub : 面板 (:8125) + 知识 (:8424) 合并镜像。镜像内 start-combined.sh
+  # 从 env 生成 metadata-instances.json，无需额外配置文件。knowledge 直连
+  # 用户提供的 LLM (LLM_MODE=custom)。
+  # ---------------------------------------------------------------------------
+  memory-hub:
+    image: ${MEMORY_HUB_IMAGE:-agentmemory/memory-hub:latest}
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      REMOTE_INSTANCE_ID: "${REMOTE_INSTANCE_ID:-default}"
+      REMOTE_INSTANCE_NAME: "${REMOTE_INSTANCE_NAME:-default}"
+      REMOTE_INSTANCE_URL: "http://memory-core:8420"
+      REMOTE_INSTANCE_KEY: "${MEMORY_CORE_GATEWAY_API_KEY:-local}"
+      # Panel UI“客户端接入地址”卡片显示的 proxy URL（供 coding agent 拷贝）
+      REMOTE_INSTANCE_PROXY_URL: "${PROXY_PUBLIC_URL:-http://127.0.0.1:${PROXY_PORT:-8096}}"
+      # knowledge 对外可达地址（含 /v3 前缀），供 agent / gateway 调用 tools 接口
+      KNOWLEDGE_PUBLIC_BASE_URL: "${KNOWLEDGE_PUBLIC_BASE_URL:-http://host.docker.internal:${KNOWLEDGE_PORT:-8424}/v3}"
+      LLM_MODE: "custom"
+      LLM_PROTOCOL: "${MEMORY_LLM_PROTOCOL:-openai}"
+      LLM_PROVIDER: "custom"
+      LLM_API_KEY: "${MEMORY_LLM_API_KEY}"
+      LLM_BASE_URL: "${MEMORY_LLM_BASE_URL}"
+      LLM_MODEL: "${MEMORY_LLM_MODEL}"
+      LLM_MAX_TOKENS: "${MEMORY_LLM_MAX_TOKENS:-32000}"
+      LLM_TIMEOUT_MS: "${MEMORY_LLM_TIMEOUT_MS:-1200000}"
+      KNOWLEDGE_LLM_BINDING_SYNC: "0"
+      PANEL_PORT: "8125"
+      KNOWLEDGE_PORT: "8424"
+    depends_on:
+      memory-core:
+        condition: service_healthy
+    volumes:
+      - tdai-panel-data:/data/knowledge
+    ports:
+      - "${PANEL_PORT:-8125}:8125"
+      - "${KNOWLEDGE_PORT:-8424}:8424"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - tdai-memory-stack
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:8125/health >/dev/null && curl -fsS http://127.0.0.1:8424/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 8s
+      retries: 15
+      start_period: 45s
+
+  # ---------------------------------------------------------------------------
+  # proxy : 上下文代理 (:8096)。挂载 config 服务渲染的 proxy-config.yaml。
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: ${PROXY_IMAGE:-agentmemory/memory-proxy:latest}
+    # build: { context: ../../MemoryProxy, dockerfile: Dockerfile }   # ← 本地构建用
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PROXY_DB_PATH: "/data/tdai-memory-proxy/proxy.db"
+    # 镜像默认 CMD 为 --config /data/config.yaml，改为挂载的渲染文件
+    command: ["--config", "/tdai-config/proxy-config.yaml"]
+    depends_on:
+      config:
+        condition: service_completed_successfully
+      memory-core:
+        condition: service_healthy
+      memory-hub:
+        condition: service_healthy
+      init-admin:
+        condition: service_completed_successfully
+    volumes:
+      - tdai-config:/tdai-config:ro
+      - tdai-proxy-data:/data
+    ports:
+      - "${PROXY_PORT:-8096}:8096"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - tdai-memory-stack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  tdai-config:
+  tdai-memory-core-data:
+  tdai-panel-data:
+  tdai-proxy-data:
+
+networks:
+  tdai-memory-stack:
+    name: tdai-memory-stack
+    driver: bridge

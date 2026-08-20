@@ -1,0 +1,67 @@
+# 由 deploy/compose 的 config-init 服务用 envsubst 渲染成 proxy-config.yaml，
+# 然后挂到 proxy 容器 /tdai-config/proxy-config.yaml。
+# 值与 deploy/global-images/start-proxy.sh (PROXY_FULL_STACK=1) 生成的一致。
+
+server:
+  host: 0.0.0.0
+  port: 8096
+  forwardTimeoutMs: 600000
+
+upstream:
+  url: "${PROXY_UPSTREAM_URL}"
+  apiKey: "${PROXY_UPSTREAM_API_KEY}"
+
+log:
+  file: ""
+  level: ${PROXY_LOG_LEVEL}
+  backend: console
+
+# tdai 内核对接（用于 injection / skill / auth）
+tdai:
+  enabled: ${PROXY_ENABLE_TDAI}
+  endpoint: "http://memory-core:8420"
+  apiKey: "${MEMORY_CORE_GATEWAY_API_KEY}"
+  serviceId: default
+  memory:
+    enabled: true
+    inject: true
+    writeL0: true
+    recallL1: true
+    injectL2L3: true
+
+skill:
+  endpoint: "http://memory-core:8420"
+  serviceToken: "${MEMORY_CORE_GATEWAY_API_KEY}"
+
+auth:
+  enabled: ${PROXY_ENABLE_AUTH}
+  url: "http://memory-core:8420"
+  timeoutMs: 5000
+
+sessionInit:
+  enabled: ${PROXY_ENABLE_SESSION_INIT}
+  maxRetries: 3
+  injectAgentContext: true
+  injectTaskContext: true
+  headerAutoSelect:
+    enabled: true
+    teamHeader: "x-team-id"
+    agentHeader: "x-agent-id"
+    taskHeader: "x-task-id"
+    onMismatch: "form"
+
+costGuard:
+  enabled: false
+
+# skill + knowledge + tdai-memory 三个注入器。knowledge 注入默认关闭
+#（injection.knowledge.enabled 缺省 false）；如需打开 Knowledge 注入，单独
+# 在这里把 knowledge.enabled: true 即可。
+injection:
+  enabled: true
+  injectors:
+    - skill
+    - knowledge
+    - tdai-memory
+
+redis:
+  enabled: ${PROXY_ENABLE_REDIS}
